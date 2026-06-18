@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -18,12 +19,14 @@ type InterfaceStats struct {
 	LastTime      time.Time
 	UploadRate    float64
 	DownloadRate  float64
+	Active        bool
 }
 
 type BandwidthMonitor struct {
-	mu        sync.RWMutex
-	stats     map[string]*InterfaceStats
-	interval  time.Duration
+	mu          sync.RWMutex
+	stats       map[string]*InterfaceStats
+	interval    time.Duration
+	activeNames []string
 }
 
 type BandwidthResponse struct {
@@ -37,6 +40,47 @@ type BandwidthResponse struct {
 	Timestamp    string  `json:"timestamp"`
 }
 
+type AllBandwidthResponse struct {
+	Interfaces []BandwidthResponse `json:"interfaces"`
+	Total      BandwidthResponse   `json:"total"`
+}
+
+func isLoopback(name string) bool {
+	lower := strings.ToLower(name)
+	return lower == "lo" || lower == "loopback" || strings.HasPrefix(lower, "loopback")
+}
+
+func discoverActiveInterfaces() ([]string, error) {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return nil, fmt.Errorf("获取网卡列表失败: %w", err)
+	}
+
+	var names []string
+	for _, iface := range interfaces {
+		if isLoopback(iface.Name) {
+			continue
+		}
+		isUp := false
+		for _, flag := range iface.Flags {
+			if flag.String() == "up" {
+				isUp = true
+				break
+			}
+		}
+		if !isUp {
+			continue
+		}
+		if len(iface.Addrs) == 0 {
+			continue
+		}
+		names = append(names, iface.Name)
+	}
+
+	sort.Strings(names)
+	return names, nil
+}
+
 func NewBandwidthMonitor(interval time.Duration) *BandwidthMonitor {
 	return &BandwidthMonitor{
 		stats:    make(map[string]*InterfaceStats),
@@ -48,10 +92,43 @@ func (bm *BandwidthMonitor) Start() {
 	ticker := time.NewTicker(bm.interval)
 	defer ticker.Stop()
 
+	bm.refreshInterfaces()
 	bm.updateOnce()
+
 	for range ticker.C {
+		bm.refreshInterfaces()
 		bm.updateOnce()
+		bm.cleanupStale()
 	}
+}
+
+func (bm *BandwidthMonitor) refreshInterfaces() {
+	names, err := discoverActiveInterfaces()
+	if err != nil {
+		log.Printf("刷新网卡列表失败: %v", err)
+		return
+	}
+
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+
+	newSet := make(map[string]bool, len(names))
+	for _, name := range names {
+		newSet[name] = true
+		if _, exists := bm.stats[name]; !exists {
+			bm.stats[name] = &InterfaceStats{Active: true}
+		} else {
+			bm.stats[name].Active = true
+		}
+	}
+
+	for name, stat := range bm.stats {
+		if !newSet[name] {
+			stat.Active = false
+		}
+	}
+
+	bm.activeNames = names
 }
 
 func (bm *BandwidthMonitor) updateOnce() {
@@ -63,62 +140,101 @@ func (bm *BandwidthMonitor) updateOnce() {
 
 	now := time.Now()
 
+	counterMap := make(map[string]net.IOCountersStat, len(counters))
+	for _, c := range counters {
+		counterMap[c.Name] = c
+	}
+
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
 
-	for _, counter := range counters {
-		prev, exists := bm.stats[counter.Name]
-		if !exists {
-			bm.stats[counter.Name] = &InterfaceStats{
-				LastBytesSent: counter.BytesSent,
-				LastBytesRecv: counter.BytesRecv,
-				LastTime:      now,
-			}
+	for name, stat := range bm.stats {
+		counter, found := counterMap[name]
+		if !found {
 			continue
 		}
 
-		elapsed := now.Sub(prev.LastTime).Seconds()
+		if stat.LastTime.IsZero() {
+			stat.LastBytesSent = counter.BytesSent
+			stat.LastBytesRecv = counter.BytesRecv
+			stat.LastTime = now
+			continue
+		}
+
+		elapsed := now.Sub(stat.LastTime).Seconds()
 		if elapsed > 0 {
 			var sentDelta, recvDelta uint64
 
-			if counter.BytesSent >= prev.LastBytesSent {
-				sentDelta = counter.BytesSent - prev.LastBytesSent
+			if counter.BytesSent >= stat.LastBytesSent {
+				sentDelta = counter.BytesSent - stat.LastBytesSent
+			} else {
+				sentDelta = counter.BytesSent
 			}
-			if counter.BytesRecv >= prev.LastBytesRecv {
-				recvDelta = counter.BytesRecv - prev.LastBytesRecv
+			if counter.BytesRecv >= stat.LastBytesRecv {
+				recvDelta = counter.BytesRecv - stat.LastBytesRecv
+			} else {
+				recvDelta = counter.BytesRecv
 			}
 
-			prev.UploadRate = float64(sentDelta) / elapsed
-			prev.DownloadRate = float64(recvDelta) / elapsed
+			stat.UploadRate = float64(sentDelta) / elapsed
+			stat.DownloadRate = float64(recvDelta) / elapsed
 		}
 
-		prev.LastBytesSent = counter.BytesSent
-		prev.LastBytesRecv = counter.BytesRecv
-		prev.LastTime = now
+		stat.LastBytesSent = counter.BytesSent
+		stat.LastBytesRecv = counter.BytesRecv
+		stat.LastTime = now
 	}
 }
 
-func (bm *BandwidthMonitor) GetAll() []BandwidthResponse {
+func (bm *BandwidthMonitor) cleanupStale() {
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+
+	for name, stat := range bm.stats {
+		if !stat.Active {
+			delete(bm.stats, name)
+			log.Printf("移除已离线网卡: %s", name)
+		}
+	}
+}
+
+func toResponse(name string, uploadRate, downloadRate float64, now string) BandwidthResponse {
+	return BandwidthResponse{
+		Interface:    name,
+		UploadBps:    uploadRate,
+		DownloadBps:  downloadRate,
+		UploadKBps:   uploadRate / 1024,
+		DownloadKBps: downloadRate / 1024,
+		UploadMBps:   uploadRate / 1024 / 1024,
+		DownloadMBps: downloadRate / 1024 / 1024,
+		Timestamp:    now,
+	}
+}
+
+func (bm *BandwidthMonitor) GetAll() AllBandwidthResponse {
 	bm.mu.RLock()
 	defer bm.mu.RUnlock()
 
 	now := time.Now().Format(time.RFC3339)
-	result := make([]BandwidthResponse, 0, len(bm.stats))
+	result := make([]BandwidthResponse, 0, len(bm.activeNames))
 
-	for name, stat := range bm.stats {
-		result = append(result, BandwidthResponse{
-			Interface:    name,
-			UploadBps:    stat.UploadRate,
-			DownloadBps:  stat.DownloadRate,
-			UploadKBps:   stat.UploadRate / 1024,
-			DownloadKBps: stat.DownloadRate / 1024,
-			UploadMBps:   stat.UploadRate / 1024 / 1024,
-			DownloadMBps: stat.DownloadRate / 1024 / 1024,
-			Timestamp:    now,
-		})
+	var totalUpload, totalDownload float64
+
+	for _, name := range bm.activeNames {
+		stat, exists := bm.stats[name]
+		if !exists {
+			continue
+		}
+		resp := toResponse(name, stat.UploadRate, stat.DownloadRate, now)
+		result = append(result, resp)
+		totalUpload += stat.UploadRate
+		totalDownload += stat.DownloadRate
 	}
 
-	return result
+	return AllBandwidthResponse{
+		Interfaces: result,
+		Total:      toResponse("total", totalUpload, totalDownload, now),
+	}
 }
 
 func (bm *BandwidthMonitor) GetByName(name string) (*BandwidthResponse, bool) {
@@ -126,21 +242,22 @@ func (bm *BandwidthMonitor) GetByName(name string) (*BandwidthResponse, bool) {
 	defer bm.mu.RUnlock()
 
 	stat, exists := bm.stats[name]
-	if !exists {
+	if !exists || !stat.Active {
 		return nil, false
 	}
 
 	now := time.Now().Format(time.RFC3339)
-	return &BandwidthResponse{
-		Interface:    name,
-		UploadBps:    stat.UploadRate,
-		DownloadBps:  stat.DownloadRate,
-		UploadKBps:   stat.UploadRate / 1024,
-		DownloadKBps: stat.DownloadRate / 1024,
-		UploadMBps:   stat.UploadRate / 1024 / 1024,
-		DownloadMBps: stat.DownloadRate / 1024 / 1024,
-		Timestamp:    now,
-	}, true
+	resp := toResponse(name, stat.UploadRate, stat.DownloadRate, now)
+	return &resp, true
+}
+
+func (bm *BandwidthMonitor) GetInterfaceNames() []string {
+	bm.mu.RLock()
+	defer bm.mu.RUnlock()
+
+	names := make([]string, len(bm.activeNames))
+	copy(names, bm.activeNames)
+	return names
 }
 
 func handleBandwidthAll(bm *BandwidthMonitor) http.HandlerFunc {
@@ -169,7 +286,12 @@ func handleBandwidthByName(bm *BandwidthMonitor) http.HandlerFunc {
 		name := strings.TrimPrefix(r.URL.Path, "/bandwidth/")
 		name = strings.TrimSpace(name)
 		if name == "" {
-			http.Error(w, "网卡名称不能为空", http.StatusBadRequest)
+			resp := map[string]interface{}{
+				"code":    400,
+				"message": "网卡名称不能为空，可用的网卡: " + strings.Join(bm.GetInterfaceNames(), ", "),
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(resp)
 			return
 		}
 
@@ -177,7 +299,7 @@ func handleBandwidthByName(bm *BandwidthMonitor) http.HandlerFunc {
 		if !exists {
 			resp := map[string]interface{}{
 				"code":    404,
-				"message": fmt.Sprintf("网卡 %s 不存在", name),
+				"message": fmt.Sprintf("网卡 %s 不存在，可用的网卡: %s", name, strings.Join(bm.GetInterfaceNames(), ", ")),
 			}
 			w.WriteHeader(http.StatusNotFound)
 			json.NewEncoder(w).Encode(resp)
